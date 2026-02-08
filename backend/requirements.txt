@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+numpy
+torch
+simpleitk
+pillow
+monai
+python-multipart
+torchvision

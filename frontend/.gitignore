@@ -1,0 +1,22 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node / Frontend
+node_modules/
+dist/
+
+# Environment & configs
+.env
+
+# IDE
+.vscode/
+
+# Runtime folders
+backend/temp/
+backend/uploads/
+
+# OS
+.DS_Store
+Thumbs.db
