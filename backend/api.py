@@ -1,6 +1,6 @@
 """
 FastAPI Backend for Lung Nodule Pseudo-Panoptic Segmentation
-Production-ready version with all critical fixes
+Production-ready version with evaluation integration
 """
 
 # =========================
@@ -30,11 +30,16 @@ from scipy import ndimage
 # =========================
 # LOCAL MODULES
 # =========================
-from backend.pseudo_panoptic import boxes_to_pseudo_panoptic
-from backend.panoptic_stats import (
+from pseudo_panoptic import boxes_to_pseudo_panoptic
+from panoptic_stats import (
     compute_panoptic_stats,
     get_instance_details,
 )
+
+# =========================
+# EVALUATION ROUTER (PATCH)
+# =========================
+from evaluation_api import eval_router, register_cache_getter
 
 # =========================
 # MONAI IMPORTS
@@ -58,8 +63,8 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 # Cache configuration
-MAX_CACHE_ITEMS = 10  # Maximum number of scans to keep in memory
-MAX_CACHE_AGE_SECONDS = 3600  # 1 hour
+MAX_CACHE_ITEMS = 10
+MAX_CACHE_AGE_SECONDS = 3600
 
 print(f"📂 Project root: {PROJECT_ROOT}")
 print(f"📂 Model path: {MODEL_PATH}")
@@ -77,6 +82,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount evaluation router
+app.include_router(eval_router)
 
 # =========================
 # RESPONSE SCHEMA
@@ -97,12 +105,10 @@ class CacheEntry:
         self.data = data
         self.timestamp = time.time()
 
-# OrderedDict to maintain insertion order for LRU eviction
 segmentation_cache = OrderedDict()
 
 def add_to_cache(scan_id: str, data: dict):
     """Add item to cache with LRU eviction."""
-    # Remove oldest if cache is full
     if len(segmentation_cache) >= MAX_CACHE_ITEMS:
         oldest_key = next(iter(segmentation_cache))
         removed = segmentation_cache.pop(oldest_key)
@@ -125,6 +131,9 @@ def get_from_cache(scan_id: str) -> Optional[dict]:
         return None
     
     return entry.data
+
+# Register cache accessor with evaluation router (avoids cross-import issues)
+register_cache_getter(get_from_cache)
 
 # =========================
 # CT RESAMPLING
@@ -149,7 +158,6 @@ def resample_ct(img, out_spacing=(2.0, 2.0, 2.0)):
 
     resampled = resampler.Execute(img)
     
-    # Verify spacing after resampling
     actual_spacing = resampled.GetSpacing()
     print(f"✅ Resampled spacing: {actual_spacing}")
     
@@ -226,14 +234,14 @@ class ModelSingleton:
 
         self.detector.set_box_selector_parameters(
             score_thresh=0.02,
-            nms_thresh=0.22,
+            nms_thresh=0.3,
             detections_per_img=300,
         )
 
         self.detector.set_sliding_window_inferer(
             roi_size=(96, 96, 96),
             sw_batch_size=1,
-            overlap=0.25,
+            overlap=0.5,
             mode="gaussian",
         )
 
@@ -257,7 +265,7 @@ async def startup_event():
     ModelSingleton.get_instance()
 
 # =========================
-# UPLOAD ENDPOINT (FIXED)
+# UPLOAD ENDPOINT
 # =========================
 @app.post("/upload")
 async def upload_file(
@@ -270,22 +278,25 @@ async def upload_file(
         scan_id = str(uuid.uuid4())
         mhd_path = UPLOAD_DIR / f"{scan_id}.mhd"
 
-        # FIX #1: Proper .mhd handling
         try:
-            # .mhd files are ASCII text with specific format
             content = (await file.read()).decode("ascii", errors="replace")
         except UnicodeDecodeError:
-            # Fallback to UTF-8 with replacement
             content = (await file.read()).decode("utf-8", errors="replace")
         
-        # Update ElementDataFile reference
         lines = [
             f"ElementDataFile = {scan_id}.raw" if l.startswith("ElementDataFile") else l
             for l in content.splitlines()
         ]
         mhd_path.write_text("\n".join(lines), encoding="ascii")
         
-        return {"status": "success", "scan_id": scan_id, "file_type": "mhd"}
+        # Return the original filename so frontend can extract seriesuid
+        original_name = Path(file.filename).stem
+        return {
+            "status": "success",
+            "scan_id": scan_id,
+            "file_type": "mhd",
+            "original_filename": original_name,
+        }
 
     elif ext == ".raw":
         if not scan_id:
@@ -297,12 +308,12 @@ async def upload_file(
     raise HTTPException(400, "Unsupported file type")
 
 # =========================
-# INFERENCE ENDPOINT (FIXED)
+# INFERENCE ENDPOINT (PATCHED)
 # =========================
 @app.post("/infer", response_model=InferenceResponse)
 async def infer(
     scan_id: str = Form(...),
-    score_threshold: float = Form(0.3),
+    score_threshold: float = Form(0.1),
     overlap_strategy: str = Form("highest_score"),
 ):
     model = ModelSingleton.get_instance()
@@ -317,10 +328,15 @@ async def infer(
         img = sitk.DICOMOrient(img, "RAS")
         img = resample_ct(img, (2.0, 2.0, 2.0))
         
-        # Store actual spacing for stats (should be 2.0, 2.0, 2.0 after resampling)
+        # Store actual spacing for stats
         actual_spacing = img.GetSpacing()
         voxel_spacing = tuple(actual_spacing)[::-1]  # Convert to (z,y,x)
         print(f"📏 Voxel spacing for stats: {voxel_spacing}")
+
+        # ── EVAL PATCH: Store metadata for evaluation ──
+        resampled_origin = img.GetOrigin()         # (x,y,z)
+        resampled_spacing = img.GetSpacing()       # (x,y,z)
+        resampled_direction = np.array(img.GetDirection()).reshape(3, 3)
 
         vol_np = sitk.GetArrayFromImage(img).astype(np.float32)
         vol_np = np.clip(vol_np, -1024, 300)
@@ -333,7 +349,7 @@ async def infer(
                 "spacing": voxel_spacing,
                 "pixdim": (1.0, *voxel_spacing),
             },
-        ).unsqueeze(0).to(model.device)  # (1, 1, D, H, W)
+        ).unsqueeze(0).to(model.device)
 
         print(f"✅ Input shape: {vol.shape}")
 
@@ -341,7 +357,6 @@ async def infer(
             outputs = model.detector(vol)
             result = outputs[0]
             
-            # FIX #3: Robust score key handling
             scores = None
             if "label_scores" in result:
                 scores = result["label_scores"]
@@ -391,6 +406,8 @@ async def infer(
             image_shape=vol.shape[-3:],
             overlap_strategy=overlap_strategy,
             score_thresh=score_threshold,
+            mask_shape="refined",       # ellipsoid + CT intensity refinement
+            volume=vol[0, 0],           # raw CT volume for intensity-guided segmentation
         )
 
         stats = compute_panoptic_stats(
@@ -406,19 +423,26 @@ async def infer(
             voxel_spacing=voxel_spacing
         )
 
-        # FIX #2: Proper volume extraction (remove both batch and channel dims)
-        # vol shape is (1, 1, D, H, W), we want (D, H, W)
-        original_volume = vol[0, 0].cpu()  # Correct way to get (D, H, W)
+        original_volume = vol[0, 0].cpu().numpy()
         
+        # ── EVAL PATCH: Store all data needed for evaluation ──
+        # CRITICAL: Convert everything to numpy/native Python types.
+        # Storing torch tensors in cache is fragile — downstream code
+        # (evaluation, visualization) uses numpy operations like np.unique().
         cache_data = {
-            'semantic_mask': semantic_mask.cpu(),
-            'instance_mask': instance_mask.cpu(),
-            'original_volume': original_volume,
-            'image_shape': vol.shape[-3:],
-            'voxel_spacing': voxel_spacing,
+            'semantic_mask': semantic_mask.cpu().numpy(),    # (D,H,W) uint8
+            'instance_mask': instance_mask.cpu().numpy(),    # (D,H,W) int32
+            'original_volume': original_volume,              # (D,H,W) float32
+            'image_shape': list(int(s) for s in vol.shape[-3:]),  # [D,H,W] plain ints
+            'voxel_spacing': list(voxel_spacing),            # [sz,sy,sx] floats
+            # Evaluation metadata
+            'origin': tuple(float(v) for v in resampled_origin),          # (x,y,z) mm
+            'spacing_xyz': tuple(float(v) for v in resampled_spacing),    # (x,y,z) mm
+            'direction': resampled_direction.tolist(),                     # 3x3 as nested list
+            'pred_boxes': boxes.cpu().numpy(),               # (N,6) float32 numpy
+            'pred_scores': scores.cpu().numpy(),             # (N,) float32 numpy
         }
         
-        # FIX #4: Use cache with LRU eviction
         add_to_cache(scan_id, cache_data)
 
         return InferenceResponse(
@@ -457,8 +481,18 @@ async def cleanup_scan(scan_id: str):
     
     return {"status": "success", "deleted": deleted}
 
+# Helper: safely convert cache values to numpy (handles both torch tensors and numpy arrays)
+def _ensure_numpy(val):
+    """Convert torch tensor or numpy array to numpy. No-op if already numpy."""
+    if hasattr(val, 'cpu'):       # torch tensor
+        return val.cpu().numpy()
+    if hasattr(val, 'numpy'):     # torch tensor (another path)
+        return val.numpy()
+    return np.asarray(val)        # already numpy or list
+
+
 # =========================
-# SLICE VISUALIZATION (FIXED)
+# SLICE VISUALIZATION
 # =========================
 @app.get("/visualize/{scan_id}/slice/{slice_idx}")
 async def visualize_slice(
@@ -467,18 +501,14 @@ async def visualize_slice(
     view: str = "axial",
     highlight_instance: Optional[int] = None
 ):
-
-
     cache = get_from_cache(scan_id)
     if cache is None:
         raise HTTPException(404, "Segmentation not found or expired")
 
-    volume = cache['original_volume'].numpy()
-    semantic = cache['semantic_mask'].numpy()
-    instance = cache['instance_mask'].numpy()
+    volume = _ensure_numpy(cache['original_volume'])
+    semantic = _ensure_numpy(cache['semantic_mask'])
+    instance = _ensure_numpy(cache['instance_mask'])
 
-    
-    # FIX #6: Proper slice validation
     if view == "axial":
         max_idx = volume.shape[0] - 1
         if slice_idx < 0 or slice_idx > max_idx:
@@ -503,17 +533,14 @@ async def visualize_slice(
     else:
         raise HTTPException(400, "Invalid view. Use 'axial', 'sagittal', or 'coronal'")
     
-    # Create figure
     fig = plt.figure(figsize=(18, 6), facecolor='#0f172a')
     gs = fig.add_gridspec(1, 3, hspace=0.05, wspace=0.05)
     
-    # 1. Original CT
     ax1 = fig.add_subplot(gs[0, 0])
     ax1.imshow(img, cmap='gray', origin='lower')
     ax1.set_title('Original CT', color='white', fontsize=14)
     ax1.axis('off')
     
-    # 2. Semantic (all nodules)
     ax2 = fig.add_subplot(gs[0, 1])
     ax2.imshow(img, cmap='gray', origin='lower', alpha=0.85)
     
@@ -525,7 +552,6 @@ async def visualize_slice(
     ax2.set_title('Semantic Segmentation', color='white', fontsize=14)
     ax2.axis('off')
     
-    # 3. Instance (individual nodules with actual masks)
     ax3 = fig.add_subplot(gs[0, 2])
     ax3.imshow(img, cmap='gray', origin='lower', alpha=0.85)
     
@@ -571,7 +597,7 @@ async def visualize_slice(
     return Response(content=buf.getvalue(), media_type="image/png")
 
 # =========================
-# MONTAGE VIEW (FIXED - TRUE PSEUDO-PANOPTIC)
+# MONTAGE VIEW
 # =========================
 @app.get("/visualize/{scan_id}/montage")
 async def visualize_montage(
@@ -579,16 +605,12 @@ async def visualize_montage(
     view: str = "axial",
     num_slices: int = 12
 ):
-    """
-    True pseudo-panoptic montage: each instance gets unique color.
-    This is NOT semantic segmentation - instances are preserved.
-    """
     cache = get_from_cache(scan_id)
     if cache is None:
         raise HTTPException(404, "Segmentation not found or expired")
     
-    volume = cache['original_volume'].numpy()
-    instance = cache['instance_mask'].numpy()
+    volume = _ensure_numpy(cache['original_volume'])
+    instance = _ensure_numpy(cache['instance_mask'])
     
     if view == "axial":
         total_slices = volume.shape[0]
@@ -603,7 +625,6 @@ async def visualize_montage(
     fig = plt.figure(figsize=(4*cols, 4*rows), facecolor='#0f172a')
     gs = fig.add_gridspec(rows, cols, hspace=0.15, wspace=0.05)
     
-    # Generate consistent colors for all instances
     colors = plt.cm.tab20(np.linspace(0, 1, 20))
     
     for idx, slice_idx in enumerate(slice_indices):
@@ -622,7 +643,6 @@ async def visualize_montage(
         
         ax.imshow(img, cmap='gray', origin='lower', alpha=0.9)
         
-        # TRUE PSEUDO-PANOPTIC: Each instance gets unique color
         unique_instances = np.unique(inst)
         unique_instances = unique_instances[unique_instances > 0]
         
@@ -631,7 +651,6 @@ async def visualize_montage(
             if not mask.any():
                 continue
             
-            # Create colored overlay for this instance
             colored = np.zeros((*mask.shape, 4))
             color = colors[inst_idx % 20]
             colored[mask] = [*color[:3], 0.5]
@@ -652,35 +671,29 @@ async def visualize_montage(
     return Response(content=buf.getvalue(), media_type="image/png")
 
 # =========================
-# 3D VISUALIZATION (FIXED - TRUE PSEUDO-PANOPTIC)
+# 3D VISUALIZATION
 # =========================
 @app.get("/visualize/{scan_id}/3d")
 async def visualize_3d(
     scan_id: str,
     instance_id: Optional[int] = None
 ):
-    """
-    True pseudo-panoptic 3D MIP: preserves instance identities.
-    When viewing all instances, each gets a unique color.
-    """
     cache = get_from_cache(scan_id)
     if cache is None:
         raise HTTPException(404, "Segmentation not found or expired")
     
-    volume = cache['original_volume'].numpy()
-    instance = cache['instance_mask'].numpy()
+    volume = _ensure_numpy(cache['original_volume'])
+    instance = _ensure_numpy(cache['instance_mask'])
     
     fig = plt.figure(figsize=(20, 7), facecolor='#0f172a')
     gs = fig.add_gridspec(1, 3, hspace=0.05, wspace=0.1)
     
     if instance_id is not None:
-        # Single instance view
         mask = (instance == instance_id)
         if not mask.any():
             raise HTTPException(404, f"Instance {instance_id} not found")
         title = f'3D MIP - Instance #{instance_id}'
         
-        # Axial MIP
         ax1 = fig.add_subplot(gs[0, 0])
         bg = volume.max(axis=0)
         ax1.imshow(bg, cmap='gray', origin='lower', alpha=0.7)
@@ -691,7 +704,6 @@ async def visualize_3d(
         ax1.axis('off')
         plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
         
-        # Coronal MIP
         ax2 = fig.add_subplot(gs[0, 1])
         bg = volume.max(axis=1)
         ax2.imshow(bg, cmap='gray', origin='lower', alpha=0.7)
@@ -702,7 +714,6 @@ async def visualize_3d(
         ax2.axis('off')
         plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
         
-        # Sagittal MIP
         ax3 = fig.add_subplot(gs[0, 2])
         bg = volume.max(axis=2)
         ax3.imshow(bg, cmap='gray', origin='lower', alpha=0.7)
@@ -714,79 +725,38 @@ async def visualize_3d(
         plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
         
     else:
-        # TRUE PSEUDO-PANOPTIC: All instances with unique colors
+        from matplotlib.colors import LinearSegmentedColormap
         unique_instances = np.unique(instance)
         unique_instances = unique_instances[unique_instances > 0]
         colors = plt.cm.tab20(np.linspace(0, 1, 20))
         
         title = f'3D MIP - All Instances (Pseudo-Panoptic)'
         
-        # Axial MIP
-        ax1 = fig.add_subplot(gs[0, 0])
-        bg = volume.max(axis=0)
-        ax1.imshow(bg, cmap='gray', origin='lower', alpha=0.7)
-        
-        for idx, inst_id in enumerate(unique_instances):
-            mask = (instance == inst_id)
-            overlay = mask.astype(float).max(axis=0)
-            overlay_masked = np.ma.masked_where(overlay < 0.1, overlay)
+        for ax_idx, (axis, ax_title) in enumerate([(0, 'Axial'), (1, 'Coronal'), (2, 'Sagittal')]):
+            ax = fig.add_subplot(gs[0, ax_idx])
+            bg = volume.max(axis=axis)
+            ax.imshow(bg, cmap='gray', origin='lower', alpha=0.7)
             
-            # Create single-color colormap for this instance
-            color = colors[idx % 20]
-            from matplotlib.colors import LinearSegmentedColormap
-            cmap = LinearSegmentedColormap.from_list('instance', [(0,0,0,0), color])
+            for idx, inst_id in enumerate(unique_instances):
+                mask = (instance == inst_id)
+                overlay = mask.astype(float).max(axis=axis)
+                overlay_masked = np.ma.masked_where(overlay < 0.1, overlay)
+                color = colors[idx % 20]
+                cmap = LinearSegmentedColormap.from_list('instance', [(0,0,0,0), color])
+                ax.imshow(overlay_masked, cmap=cmap, alpha=0.7, origin='lower', vmin=0, vmax=1)
             
-            ax1.imshow(overlay_masked, cmap=cmap, alpha=0.7, origin='lower', vmin=0, vmax=1)
-        
-        ax1.set_title('Axial MIP', color='white', fontsize=14, fontweight='bold')
-        ax1.axis('off')
-        
-        # Coronal MIP
-        ax2 = fig.add_subplot(gs[0, 1])
-        bg = volume.max(axis=1)
-        ax2.imshow(bg, cmap='gray', origin='lower', alpha=0.7)
-        
-        for idx, inst_id in enumerate(unique_instances):
-            mask = (instance == inst_id)
-            overlay = mask.astype(float).max(axis=1)
-            overlay_masked = np.ma.masked_where(overlay < 0.1, overlay)
-            
-            color = colors[idx % 20]
-            cmap = LinearSegmentedColormap.from_list('instance', [(0,0,0,0), color])
-            
-            ax2.imshow(overlay_masked, cmap=cmap, alpha=0.7, origin='lower', vmin=0, vmax=1)
-        
-        ax2.set_title('Coronal MIP', color='white', fontsize=14, fontweight='bold')
-        ax2.axis('off')
-        
-        # Sagittal MIP
-        ax3 = fig.add_subplot(gs[0, 2])
-        bg = volume.max(axis=2)
-        ax3.imshow(bg, cmap='gray', origin='lower', alpha=0.7)
-        
-        for idx, inst_id in enumerate(unique_instances):
-            mask = (instance == inst_id)
-            overlay = mask.astype(float).max(axis=2)
-            overlay_masked = np.ma.masked_where(overlay < 0.1, overlay)
-            
-            color = colors[idx % 20]
-            cmap = LinearSegmentedColormap.from_list('instance', [(0,0,0,0), color])
-            
-            ax3.imshow(overlay_masked, cmap=cmap, alpha=0.7, origin='lower', vmin=0, vmax=1)
-        
-        ax3.set_title('Sagittal MIP', color='white', fontsize=14, fontweight='bold')
-        ax3.axis('off')
+            ax.set_title(f'{ax_title} MIP', color='white', fontsize=14, fontweight='bold')
+            ax.axis('off')
     
     fig.suptitle(title, color='white', fontsize=18, fontweight='bold')
     
-    # Add info text
     if instance_id:
         fig.text(0.5, 0.02, f'Maximum Intensity Projection | Instance #{instance_id}', 
                 ha='center', color='#94a3b8', fontsize=12)
     else:
-        num_instances = len(unique_instances)
+        num_inst = len(unique_instances) if 'unique_instances' in dir() else 0
         fig.text(0.5, 0.02, 
-                f'Pseudo-Panoptic Visualization | {num_instances} instances with unique colors', 
+                f'Pseudo-Panoptic Visualization | {num_inst} instances with unique colors', 
                 ha='center', color='#94a3b8', fontsize=12)
     
     buf = BytesIO()

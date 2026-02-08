@@ -22,6 +22,14 @@ export default function LungNoduleApp() {
   const [showMontage, setShowMontage] = useState(false);
   const [show3D, setShow3D] = useState(false);
 
+  // ── EVALUATION STATE (NEW) ──
+  const [annotationsLoaded, setAnnotationsLoaded] = useState(false);
+  const [annotationsInfo, setAnnotationsInfo] = useState(null);
+  const [seriesuid, setSeriesuid] = useState("");
+  const [isEvaluating, setIsEvaluating] = useState(false);
+  const [evalResults, setEvalResults] = useState(null);
+  const [showEvalSection, setShowEvalSection] = useState(false);
+
   const validateFile = (file, ext) =>
     file && file.name.toLowerCase().endsWith(ext);
 
@@ -56,6 +64,10 @@ export default function LungNoduleApp() {
         setMhdFile(file);
         setUploadStatus({ mhd: true, raw: false });
         setResults(null);
+        setEvalResults(null);
+        // Auto-extract seriesuid from mhd filename
+        const stem = file.name.replace(/\.mhd$/i, "");
+        setSeriesuid(stem);
       } else {
         setRawFile(file);
         setUploadStatus((p) => ({ ...p, raw: true }));
@@ -92,6 +104,7 @@ export default function LungNoduleApp() {
       const data = await res.json();
       setResults(data);
       setSelectedSlice(Math.floor(data.image_shape[0] / 2));
+      setEvalResults(null); // Clear old eval when re-running
     } catch (err) {
       setError(err.message);
     } finally {
@@ -110,6 +123,8 @@ export default function LungNoduleApp() {
     setError(null);
     setShowMontage(false);
     setShow3D(false);
+    setEvalResults(null);
+    setSeriesuid("");
   };
 
   const getConfidenceColor = (confidence) => {
@@ -170,6 +185,90 @@ const getSafeSlice = () => {
   return Math.min(selectedSlice, getMaxSlice());
 };
 
+  // ── EVALUATION FUNCTIONS (NEW) ──
+
+  const handleAnnotationsUpload = async (file) => {
+    if (!file) return;
+    try {
+      setError(null);
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const res = await fetch(`${API_URL}/eval/load_annotations`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!res.ok) throw new Error("Failed to load annotations");
+
+      const data = await res.json();
+      setAnnotationsLoaded(true);
+      setAnnotationsInfo(data);
+    } catch (err) {
+      setError(`Annotations error: ${err.message}`);
+    }
+  };
+
+  const runEvaluation = async () => {
+    if (!scanId || !annotationsLoaded || !seriesuid) {
+      setError("Need: inference completed + annotations loaded + valid seriesuid");
+      return;
+    }
+
+    setIsEvaluating(true);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("seriesuid", seriesuid);
+      formData.append("distance_thresh_mm", "15.0");
+      formData.append("iou_thresh_match", "0.1");
+
+      const res = await fetch(`${API_URL}/eval/evaluate_scan/${scanId}`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || "Evaluation failed");
+      }
+
+      const data = await res.json();
+      setEvalResults(data);
+    } catch (err) {
+      setError(`Evaluation error: ${err.message}`);
+    } finally {
+      setIsEvaluating(false);
+    }
+  };
+
+  // Format metric value for display
+  const fmtMetric = (val, decimals = 3) => {
+    if (val === null || val === undefined) return "—";
+    return Number(val).toFixed(decimals);
+  };
+
+  const fmtPct = (val) => {
+    if (val === null || val === undefined) return "—";
+    return `${(Number(val) * 100).toFixed(1)}%`;
+  };
+
+  // Get color class for a 0-1 metric
+  const metricColor = (val) => {
+    if (val === null || val === undefined) return "text-gray-400";
+    if (val >= 0.7) return "text-green-400";
+    if (val >= 0.4) return "text-yellow-400";
+    return "text-red-400";
+  };
+
+  // Get bg gradient for metric cards
+  const metricCardBg = (val) => {
+    if (val === null || val === undefined) return "from-gray-500/10 to-gray-600/10 border-gray-500/20";
+    if (val >= 0.7) return "from-green-500/15 to-emerald-500/15 border-green-400/25";
+    if (val >= 0.4) return "from-yellow-500/15 to-amber-500/15 border-yellow-400/25";
+    return "from-red-500/15 to-rose-500/15 border-red-400/25";
+  };
 
 
   return (
@@ -379,6 +478,108 @@ const getSafeSlice = () => {
           </div>
         </div>
 
+        {/* ══════════════════════════════════════════════
+            EVALUATION: Ground Truth Section (NEW)
+            ══════════════════════════════════════════════ */}
+        <div className="bg-slate-900 border border-slate-700/40 rounded-2xl overflow-hidden">
+          <button
+            onClick={() => setShowEvalSection(!showEvalSection)}
+            className="w-full p-6 flex items-center justify-between hover:bg-white/[0.02] transition-colors"
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-gradient-to-br from-amber-500 to-orange-500 rounded-lg flex items-center justify-center">
+                <Activity className="w-5 h-5" />
+              </div>
+              <div className="text-left">
+                <h2 className="text-xl font-bold">Evaluation Metrics</h2>
+                <p className="text-sm text-amber-300">
+                  {annotationsLoaded
+                    ? `✓ Annotations loaded (${annotationsInfo?.num_nodules || 0} nodules across ${annotationsInfo?.num_series || 0} scans)`
+                    : "Upload LUNA16 annotations.csv to enable evaluation"}
+                </p>
+              </div>
+            </div>
+            <svg
+              className={`w-5 h-5 text-gray-400 transition-transform ${showEvalSection ? "rotate-180" : ""}`}
+              fill="none" viewBox="0 0 24 24" stroke="currentColor"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+
+          {showEvalSection && (
+            <div className="px-6 pb-6 space-y-4 border-t border-slate-700/40 pt-4">
+              {/* Annotations Upload */}
+              {!annotationsLoaded ? (
+                <div>
+                  <p className="text-sm text-gray-400 mb-3">
+                    Upload the <code className="text-amber-400 bg-amber-400/10 px-1.5 py-0.5 rounded text-xs">annotations.csv</code> file from LUNA16 dataset to compare detections against ground truth.
+                  </p>
+                  <input
+                    type="file"
+                    accept=".csv"
+                    onChange={(e) => handleAnnotationsUpload(e.target.files[0])}
+                    className="hidden"
+                    id="annotations-upload"
+                  />
+                  <label
+                    htmlFor="annotations-upload"
+                    className="inline-flex items-center gap-2 px-5 py-2.5 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/30 rounded-lg cursor-pointer transition-all text-amber-300 font-medium text-sm"
+                  >
+                    <Upload className="w-4 h-4" />
+                    Upload annotations.csv
+                  </label>
+                </div>
+              ) : (
+                <div className="flex items-center gap-3">
+                  <CheckCircle className="w-5 h-5 text-green-400" />
+                  <span className="text-green-300 text-sm font-medium">
+                    Annotations loaded: {annotationsInfo?.num_nodules} nodules, {annotationsInfo?.num_series} scans
+                  </span>
+                </div>
+              )}
+
+              {/* Seriesuid field — auto-filled from .mhd filename, editable */}
+              {annotationsLoaded && (
+                <div>
+                  <label className="text-sm font-medium text-gray-300 block mb-2">
+                    Series UID
+                    <span className="text-xs text-gray-500 ml-2">(auto-extracted from .mhd filename)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={seriesuid}
+                    onChange={(e) => setSeriesuid(e.target.value)}
+                    placeholder="1.3.6.1.4.1.14519.5.2.1..."
+                    className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2.5 text-sm font-mono text-gray-200 placeholder-gray-500 focus:outline-none focus:border-amber-400/50 focus:ring-1 focus:ring-amber-400/20 transition-all"
+                  />
+                </div>
+              )}
+
+              {/* Run Evaluation Button */}
+              {annotationsLoaded && results && (
+                <button
+                  onClick={runEvaluation}
+                  disabled={isEvaluating || !seriesuid}
+                  className="w-full bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 disabled:from-gray-600 disabled:to-gray-700 disabled:cursor-not-allowed text-white py-3 rounded-xl font-bold text-base flex items-center justify-center gap-3 transition-all shadow-lg"
+                >
+                  {isEvaluating ? (
+                    <>
+                      <Loader className="w-5 h-5 animate-spin" />
+                      Evaluating against ground truth...
+                    </>
+                  ) : (
+                    <>
+                      <Activity className="w-5 h-5" />
+                      Run Evaluation
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
         {/* Run Analysis Button */}
         <button
           onClick={runInference}
@@ -422,6 +623,195 @@ const getSafeSlice = () => {
                 <div className="text-3xl font-bold">{(results.stats.mean_confidence * 100).toFixed(0)}%</div>
               </div>
             </div>
+
+            {/* ══════════════════════════════════════════════
+                EVALUATION METRICS DASHBOARD (NEW)
+                ══════════════════════════════════════════════ */}
+            {evalResults && (
+              <div className="bg-slate-900 border border-amber-500/20 rounded-2xl p-6 space-y-6">
+                {/* Header */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 bg-gradient-to-br from-amber-500 to-orange-500 rounded-lg flex items-center justify-center">
+                      <Activity className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h2 className="text-xl font-bold">Evaluation Results</h2>
+                      <p className="text-sm text-amber-300">
+                        GT: {evalResults.num_gt} nodules — Pred: {evalResults.num_pred} detections
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="px-3 py-1 bg-green-500/20 border border-green-400/30 rounded-full text-xs font-bold text-green-300">
+                      TP {evalResults.true_positives}
+                    </span>
+                    <span className="px-3 py-1 bg-red-500/20 border border-red-400/30 rounded-full text-xs font-bold text-red-300">
+                      FP {evalResults.false_positives}
+                    </span>
+                    <span className="px-3 py-1 bg-yellow-500/20 border border-yellow-400/30 rounded-full text-xs font-bold text-yellow-300">
+                      FN {evalResults.false_negatives}
+                    </span>
+                  </div>
+                </div>
+
+                {/* ── Detection Metrics Row ── */}
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                    Detection Metrics
+                  </h3>
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                    {/* Sensitivity */}
+                    <div className={`bg-gradient-to-br ${metricCardBg(evalResults.sensitivity)} border rounded-xl p-4`}>
+                      <div className="text-xs text-gray-400 mb-1">Sensitivity (Recall)</div>
+                      <div className={`text-2xl font-bold ${metricColor(evalResults.sensitivity)}`}>
+                        {fmtPct(evalResults.sensitivity)}
+                      </div>
+                      <div className="mt-2 w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-green-500 to-emerald-400 rounded-full transition-all"
+                          style={{ width: `${(evalResults.sensitivity || 0) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Precision */}
+                    <div className={`bg-gradient-to-br ${metricCardBg(evalResults.precision)} border rounded-xl p-4`}>
+                      <div className="text-xs text-gray-400 mb-1">Precision</div>
+                      <div className={`text-2xl font-bold ${metricColor(evalResults.precision)}`}>
+                        {fmtPct(evalResults.precision)}
+                      </div>
+                      <div className="mt-2 w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-blue-500 to-cyan-400 rounded-full transition-all"
+                          style={{ width: `${(evalResults.precision || 0) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* F1 */}
+                    <div className={`bg-gradient-to-br ${metricCardBg(evalResults.f1_score)} border rounded-xl p-4`}>
+                      <div className="text-xs text-gray-400 mb-1">F1 Score</div>
+                      <div className={`text-2xl font-bold ${metricColor(evalResults.f1_score)}`}>
+                        {fmtPct(evalResults.f1_score)}
+                      </div>
+                      <div className="mt-2 w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-purple-500 to-pink-400 rounded-full transition-all"
+                          style={{ width: `${(evalResults.f1_score || 0) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── Segmentation Metrics Row ── */}
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M3 3h18v18H3V3zm16 16V5H5v14h14z"/></svg>
+                    Segmentation Metrics
+                  </h3>
+                  <div className="grid grid-cols-2 gap-3">
+                    {/* Volumetric Dice */}
+                    <div className={`bg-gradient-to-br ${metricCardBg(evalResults.mean_dice)} border rounded-xl p-4`}>
+                      <div className="text-xs text-gray-400 mb-1">Volumetric Dice</div>
+                      <div className={`text-2xl font-bold ${metricColor(evalResults.mean_dice)}`}>
+                        {fmtMetric(evalResults.mean_dice)}
+                      </div>
+                      <div className="text-xs text-gray-500 mt-1">GT sphere vs pred box mask</div>
+                      <div className="mt-2 w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-teal-500 to-cyan-400 rounded-full transition-all"
+                          style={{ width: `${(evalResults.mean_dice || 0) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Volumetric IoU */}
+                    <div className={`bg-gradient-to-br ${metricCardBg(evalResults.mean_iou)} border rounded-xl p-4`}>
+                      <div className="text-xs text-gray-400 mb-1">Volumetric IoU</div>
+                      <div className={`text-2xl font-bold ${metricColor(evalResults.mean_iou)}`}>
+                        {fmtMetric(evalResults.mean_iou)}
+                      </div>
+                      <div className="text-xs text-gray-500 mt-1">Stricter than Dice</div>
+                      <div className="mt-2 w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-indigo-500 to-violet-400 rounded-full transition-all"
+                          style={{ width: `${(evalResults.mean_iou || 0) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+
+                {/* ── Per-Nodule Match Details ── */}
+                {evalResults.matches && evalResults.matches.length > 0 && (
+                  <div>
+                    <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                      <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z"/></svg>
+                      Per-Nodule Match Details
+                    </h3>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b border-white/10">
+                            <th className="text-left py-2.5 px-3 text-xs font-medium text-gray-400">GT #</th>
+                            <th className="text-left py-2.5 px-3 text-xs font-medium text-gray-400">Diameter</th>
+                            <th className="text-left py-2.5 px-3 text-xs font-medium text-gray-400">Match</th>
+                            <th className="text-left py-2.5 px-3 text-xs font-medium text-gray-400">Distance</th>
+                            <th className="text-left py-2.5 px-3 text-xs font-medium text-gray-400">Box IoU</th>
+                            <th className="text-left py-2.5 px-3 text-xs font-medium text-gray-400">Dice</th>
+                            <th className="text-left py-2.5 px-3 text-xs font-medium text-gray-400">Mask IoU</th>
+                            <th className="text-left py-2.5 px-3 text-xs font-medium text-gray-400">Score</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {evalResults.matches.map((m, idx) => (
+                            <tr key={idx} className="border-b border-white/5 hover:bg-white/[0.03]">
+                              <td className="py-2.5 px-3 font-mono font-bold text-amber-400">#{m.gt_idx + 1}</td>
+                              <td className="py-2.5 px-3">
+                                {m.gt_diameter_mm?.toFixed(1)} <span className="text-gray-500">mm</span>
+                              </td>
+                              <td className="py-2.5 px-3">
+                                {m.matched ? (
+                                  <span className="px-2 py-0.5 bg-green-500/20 border border-green-400/30 rounded text-xs font-bold text-green-300">TP</span>
+                                ) : (
+                                  <span className="px-2 py-0.5 bg-red-500/20 border border-red-400/30 rounded text-xs font-bold text-red-300">FN</span>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3 font-mono text-xs">
+                                {m.matched ? `${m.distance_mm} mm` : "—"}
+                              </td>
+                              <td className={`py-2.5 px-3 font-mono text-xs ${metricColor(m.box_iou_3d)}`}>
+                                {m.matched ? fmtMetric(m.box_iou_3d) : "—"}
+                              </td>
+                              <td className={`py-2.5 px-3 font-mono text-xs ${metricColor(m.instance_dice)}`}>
+                                {fmtMetric(m.instance_dice)}
+                              </td>
+                              <td className={`py-2.5 px-3 font-mono text-xs ${metricColor(m.instance_iou)}`}>
+                                {fmtMetric(m.instance_iou)}
+                              </td>
+                              <td className="py-2.5 px-3 font-mono text-xs">
+                                {m.pred_score !== null ? fmtPct(m.pred_score) : "—"}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* Info footer */}
+                <div className="text-xs text-gray-500 border-t border-white/5 pt-3 flex items-center gap-2">
+                  <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                  GT masks are spheres generated from LUNA16 center + diameter annotations. Pred masks are axis-aligned boxes from pseudo-panoptic.
+                  FROC/CPM requires running evaluation across multiple scans via <code className="text-amber-400/60 mx-1">run_evaluation.py</code>.
+                </div>
+              </div>
+            )}
 
             {/* Nodule List */}
             <div className="bg-slate-900 border border-slate-700/40
